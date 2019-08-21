@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Gerrit Review Checklist 2.0
-// @namespace    https://github.com/mziwisky/gerrit-checklist
+// @namespace    https://github.com/MrGrinst/gerrit-checklist
 // @version      2.0.0
 // @description  Add a checklist to your Gerrit review panel, and record responses with your submitted comments.
-// @match        https://gerrit.instructure.com/*
+// @include      https://gerrit.instructure.com/*
 // @copyright    2014+ Michael Ziwisky, 2019+ Kyle Grinstead
 // ==/UserScript==
 
@@ -18,25 +18,7 @@
 //  "defaultStatus": false // a default status of false == Not Checked, true == Checked, null == N/A
 // }
 
-function ReviewChecklistManager(optsList, defaultStatus) {
-  console.log('Gerrit review checklist added!');
-  const mgr = this;
-  this.options = optsList.map(function(opt) {
-    const option = {
-      text: opt,
-      status: defaultStatus,
-      setStatus: function(status) {
-        this.status = status;
-        mgr.updateManagedTextArea();
-      },
-    };
-    return option;
-  });
-  this.isPolyGerrit = !!document.querySelector('gr-app');
-  this.textAreaDomSelector = this.isPolyGerrit
-    ? 'gr-reply-dialog gr-textarea textarea'
-    : '.popupContent .gwt-TextArea';
-}
+// HELPER FUNCTIONS
 
 function buildElement(tag, options) {
   const element = document.createElement(tag);
@@ -48,6 +30,49 @@ function buildElement(tag, options) {
   return element;
 }
 
+function extractTextFromSelectorWithRegex(selector, regex) {
+  const elements = document.querySelectorAll(selector);
+  for (const element of Array.from(elements)) {
+    const match = element.textContent && element.textContent.match(regex);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+function querySelectorContaining(selector, text) {
+  const elements = document.querySelectorAll(selector);
+  for (const element of Array.from(elements)) {
+    if (element.textContent.includes(text)) {
+      return element;
+    }
+  }
+  return null;
+}
+
+// CONSTANTS
+
+const DEFAULT_CHECKLIST = [
+  'Changeset checked out and tried',
+  'Commit message test plan is sufficient for manual sanity checking',
+  'Automated tests cover all necessary cases',
+  'User-facing strings/dates/times/numbers are internationalized',
+  'UI interactions are accessible to screen reader, keyboard only, and visually impaired users',
+];
+const DEFAULT_DEFAULT_STATUS = null;
+
+// ReviewChecklistManager.js
+
+function ReviewChecklistManager() {
+  console.log('Gerrit review checklist added!');
+  this.setChecklistSettings(DEFAULT_CHECKLIST, DEFAULT_DEFAULT_STATUS);
+  this.isPolyGerrit = !!document.querySelector('gr-app');
+  this.textAreaDomSelector = this.isPolyGerrit
+    ? 'gr-reply-dialog gr-textarea textarea'
+    : '.popupContent .gwt-TextArea';
+}
+
 ReviewChecklistManager.create = function(defaultOptsList) {
   if (ReviewChecklistManager.instanceCreated) {
     console.log('Only a single Gerrit checklist is allowed.');
@@ -55,24 +80,7 @@ ReviewChecklistManager.create = function(defaultOptsList) {
   }
   ReviewChecklistManager.instanceCreated = true;
 
-  const repoName = document.location.toString().match(/\/c\/(.*)\/\+/)[1];
-  fetch(
-    `/plugins/gitiles/${repoName}/+show/master/.review-checklist.json?format=text`,
-  )
-    .then(function(res) {
-      return res.text().then(function(base64) {
-        if (base64 && base64 !== '') {
-          const customSettings = JSON.parse(atob(base64));
-          const {checklist, defaultStatus} = customSettings;
-          new ReviewChecklistManager(checklist, defaultStatus).activate();
-        } else {
-          new ReviewChecklistManager(defaultOptsList, null).activate();
-        }
-      });
-    })
-    .catch(function() {
-      new ReviewChecklistManager(defaultOptsList, null).activate();
-    });
+  new ReviewChecklistManager().activate();
 };
 
 ReviewChecklistManager.prototype.activate = function() {
@@ -82,39 +90,95 @@ ReviewChecklistManager.prototype.activate = function() {
   );
 };
 
-ReviewChecklistManager.prototype.domChangeListener = function() {
-  const gerTextArea = document.querySelector(this.textAreaDomSelector);
+ReviewChecklistManager.prototype.resetIfLocationChanged = function() {
+  if (this.previousLocation !== document.location.toString()) {
+    this.previousLocation = document.location.toString();
+    this._isSelfAuthored = undefined;
+    this.gerritTextArea = undefined;
 
-  if (!gerTextArea) return; // review popover is not open
-
-  this.manageTextArea(gerTextArea);
-  if (!this.optionsPresent()) {
-    this.insertOptions();
+    const _this = this;
+    const repoNameMatch = document.location.toString().match(/\/c\/(.*)\/\+/);
+    if (repoNameMatch) {
+      fetch(
+        `${window.location.protocol}${
+          window.location.hostname
+        }/plugins/gitiles/${
+          repoNameMatch[1]
+        }/+/master/.gerrit-checklist.json?format=TEXT`,
+      )
+        .then(function(res) {
+          return res.text().then(function(base64) {
+            if (base64 && base64 !== '') {
+              const customSettings = JSON.parse(atob(base64));
+              const {checklist, defaultStatus} = customSettings;
+              _this.setChecklistSettings(checklist, defaultStatus);
+            } else {
+              _this.setChecklistSettings();
+            }
+          });
+        })
+        .catch(function(e) {
+          console.error(e);
+          _this.setChecklistSettings();
+        });
+    } else {
+      this.setChecklistSettings();
+    }
   }
 };
 
-ReviewChecklistManager.prototype.manageTextArea = function(gerTextArea) {
-  if (this.gerTextArea && this.gerTextArea === gerTextArea) return;
+ReviewChecklistManager.prototype.setChecklistSettings = function(
+  checklist = DEFAULT_CHECKLIST,
+  defaultStatus = DEFAULT_DEFAULT_STATUS,
+) {
+  const _this = this;
+  this.options = checklist.map(function(opt) {
+    const option = {
+      text: opt,
+      status: defaultStatus,
+      setStatus: function(status) {
+        this.status = status;
+        _this.updateManagedTextArea();
+      },
+    };
+    return option;
+  });
+};
+
+ReviewChecklistManager.prototype.domChangeListener = function() {
+  try {
+    this.resetIfLocationChanged();
+
+    if (!this.textAreaIsVisible()) return; // stop if review popover is not open
+    if (!this.qaHasBeenRejectedOrApproved()) return; // stop if QA hasn't been +1/-1
+    if (this.isSelfAuthored()) return; // stop if current user is the author
+
+    const gerritTextArea = document.querySelector(this.textAreaDomSelector);
+    this.manageTextArea(gerritTextArea);
+    if (!this.optionsArePresent()) {
+      this.insertOptions();
+    }
+  } catch (e) {
+    console.error(e);
+  }
+};
+
+ReviewChecklistManager.prototype.manageTextArea = function(gerritTextArea) {
+  if (this.gerritTextArea && this.gerritTextArea === gerritTextArea) return;
   if (!this.textArea) {
     this.createStandinTextArea();
   }
 
-  this.gerTextArea = gerTextArea;
-  this.textArea.value = '';
-  if (this.isPolyGerrit) {
-    gerTextArea.parentElement.parentElement.style.minHeight = '11em';
-    gerTextArea.parentElement.parentElement.style.overflow = 'scroll';
-  } else {
-    gerTextArea.parentElement.parentElement.style.maxHeight = 'none'; // let gray bg grow to fit new checkboxes
-  }
-  gerTextArea.parentElement.insertBefore(
+  this.gerritTextArea = gerritTextArea;
+  this.textArea.value = gerritTextArea.value;
+  gerritTextArea.parentElement.insertBefore(
     this.textArea,
-    gerTextArea.nextSibling,
+    gerritTextArea.nextSibling,
   );
-  gerTextArea.style.position = 'fixed';
-  gerTextArea.style.left = '-10000px'; // like hide(), but allows it to get focus
+  gerritTextArea.style.position = 'fixed';
+  gerritTextArea.style.left = '-10000px'; // like hide(), but allows it to get focus
   const ta = this.textArea;
-  gerTextArea.addEventListener('focus', function() {
+  gerritTextArea.addEventListener('focus', function() {
     ta.focus();
   });
   this.updateManagedTextArea();
@@ -126,7 +190,6 @@ ReviewChecklistManager.prototype.createStandinTextArea = function() {
     textAreaOptions = {
       autocomplete: true,
       placeholder: 'Say something nice...',
-      style: 'height: inherit;',
       rows: 4,
     };
   } else {
@@ -148,34 +211,52 @@ ReviewChecklistManager.prototype.createStandinTextArea = function() {
   );
 
   // forward special key sequences to the original textArea to get special behaviors
-  const mgr = this;
+  const _this = this;
   this.textArea.addEventListener('keydown', function(evt) {
     if (
       (evt.which == 13 && evt.ctrlKey) || // ctrl-Enter
       evt.which == 27 // esc
     ) {
-      mgr.gerTextArea.focus();
-      mgr.gerTextArea.trigger(evt);
+      _this.gerritTextArea.focus();
+      _this.gerritTextArea.trigger(evt);
     }
   });
 };
 
 ReviewChecklistManager.prototype.updateManagedTextArea = function() {
-  if (!this.gerTextArea) return;
-  this.gerTextArea.value = '' + this.textArea.value + this.checklistText();
-  this.gerTextArea.dispatchEvent(new Event('input', {bubbles: true}));
+  if (!this.gerritTextArea) return;
+  this.gerritTextArea.value = '' + this.textArea.value + this.checklistText();
+  this.gerritTextArea.dispatchEvent(new Event('input', {bubbles: true}));
 };
 
 ReviewChecklistManager.prototype.insertOptions = function() {
-  this.textArea.parentElement.appendChild(buildElement('hr'));
-  this.textArea.parentElement.appendChild(this.optionsTable());
-};
+  if (this.isPolyGerrit) {
+    const section = buildElement('section');
+    section.classList.add('style-scope', 'gr-reply-dialog');
+    section.appendChild(this.buildOptionsTable());
 
-ReviewChecklistManager.prototype.optionsTable = function() {
-  if (!this._optionsTable) {
-    this._optionsTable = this.buildOptionsTable();
+    const radioButtonsContainer = querySelectorContaining(
+      'gr-reply-dialog section.labelsContainer',
+      'Code-Review',
+    );
+    if (radioButtonsContainer && this.options.length > 0) {
+      radioButtonsContainer.parentElement.insertBefore(
+        section,
+        radioButtonsContainer.nextSibling,
+      );
+    }
+  } else {
+    const radioButtonsContainer = querySelectorContaining(
+      'div.com-google-gerrit-client-change-Resources-Style-section',
+      'Code-Review',
+    );
+    if (radioButtonsContainer && this.options.length > 0) {
+      radioButtonsContainer.parentElement.insertBefore(
+        this.buildOptionsTable(),
+        radioButtonsContainer.nextSibling,
+      );
+    }
   }
-  return this._optionsTable;
 };
 
 ReviewChecklistManager.prototype.checklistText = function() {
@@ -253,14 +334,68 @@ ReviewChecklistManager.prototype.buildOptionsTable = function() {
   return table;
 };
 
-ReviewChecklistManager.prototype.optionsPresent = function() {
+ReviewChecklistManager.prototype.textAreaIsVisible = function() {
+  if (this.isPolyGerrit) {
+    const overlay = document.querySelector('#replyOverlay');
+    return overlay && overlay.getAttribute('aria-hidden') !== 'true';
+  } else {
+    return !!document.querySelector(this.textAreaDomSelector);
+  }
+};
+
+ReviewChecklistManager.prototype.qaHasBeenRejectedOrApproved = function() {
+  if (this.isPolyGerrit) {
+    const qaInputs = document.querySelectorAll(
+      'gr-label-score-row[name=QA-Review] gr-button',
+    );
+    const selectedIndex = Array.from(qaInputs)
+      .map(function(e) {
+        return e.classList.contains('iron-selected');
+      })
+      .indexOf(true);
+    return selectedIndex !== 1; // the middle QA-Review value isn't selected,
+    // meaning Rejected or Approved is selected
+  } else {
+    const qaInputs = document.querySelectorAll('input[name=QA-Review]');
+    const selectedIndex = Array.from(qaInputs)
+      .map(function(e) {
+        return e.checked;
+      })
+      .indexOf(true);
+    return selectedIndex !== 1; // the middle QA-Review value isn't selected,
+    // meaning Rejected or Approved is selected
+  }
+};
+
+ReviewChecklistManager.prototype.isSelfAuthored = function() {
+  if (this._isSelfAuthored === undefined) {
+    if (this.isPolyGerrit) {
+      const authorName = extractTextFromSelectorWithRegex(
+        'section',
+        /^\s*Owner\s+(.*?)\s+\(/,
+      );
+      const currentUserName = extractTextFromSelectorWithRegex(
+        'ul.gr-dropdown > div',
+        /^\s*(.*?)\s+\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+\s*/,
+      );
+      this._isSelfAuthored =
+        authorName && currentUserName && authorName === currentUserName;
+    } else {
+      const authorName = extractTextFromSelectorWithRegex(
+        'tr',
+        /^\s*Author\s+(.*?)\s+</,
+      );
+      this._isSelfAuthored =
+        authorName &&
+        authorName ===
+          document.querySelector('span.menuBarUserName').textContent.trim();
+    }
+  }
+  return this._isSelfAuthored;
+};
+
+ReviewChecklistManager.prototype.optionsArePresent = function() {
   return !!document.querySelector('#review-checklist');
 };
 
-ReviewChecklistManager.create([
-  'Changeset checked out and tried',
-  'Commit message test plan is sufficient for manual sanity checking',
-  'Automated tests cover all necessary cases',
-  'User-facing strings/dates/times/numbers are internationalized',
-  'UI interactions are accessible to screen reader, keyboard only, and visually impaired users',
-]);
+ReviewChecklistManager.create();
